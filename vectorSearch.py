@@ -43,36 +43,234 @@ steps when question is asked:
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import os
 import pandas as pd
+import datetime
 
-df = pd.read_csv("realistic_restaurant_reviews.csv")
+DB_LOCATION = "./chroma_lanchain_db"
+COLLECTION_NAME = "restaurant_reviews"
+EMBEDDING_MODEL_NAME = "nomic-embed-text:v1.5"
+RETRIEVER_K = 5 # Number of documents to retrieve for each query
+CSV_FILE_PATH = "realistic_restaurant_reviews.csv"
 
-embeddings = OllamaEmbeddings(model="nomic-embed-text:v1.5")
+# df = pd.read_csv(CSV_FILE_PATH)
 
-db_location = "./chroma_lanchain_db"
+CSV_COLUMNS = ["Title", "Date", "Rating", "Review"]
 
-add_documents = not os.path.exists(db_location) # If the db does not exist (not False) - add documents to db, if it exists (not True) - do nothing
+def ensure_csv_exists(file_path=CSV_FILE_PATH):
+    """Ensures the CSV file exists and has the correct columns, if not, creates it an empty one."""
+    if not os.path.exists(file_path):
+        print(f"CSV file {file_path} does not exist, creating an empty one.")
+        df_empty = pd.DataFrame(columns=CSV_COLUMNS)
+        df_empty.to_csv(file_path, index=False)
 
-if add_documents:
+def get_embedding_model():
+    """Initializes and returns the Ollama embeddings model."""
+    print(f"Initializing embedding model: {EMBEDDING_MODEL_NAME}")
+    return OllamaEmbeddings(model=EMBEDDING_MODEL_NAME)
+
+def load_reviews_from_csv(file_path=CSV_FILE_PATH):
+    """Loads reviews from a CSV file and converts them into LangChain Document objects."""
+    ensure_csv_exists(file_path)
+    print(f"Loading reviews from CSV file: {file_path}")
+
+    df = pd.read_csv(file_path)
     documents = []
-    ids = [] # List to store document IDs, which is required by the vectorstore
-
     for i, row in df.iterrows():
-        document = Document(page_content=row["Title"] + row["Review"], metadata={"rating": row["Rating"],"date": row["Date"]},
-                            id = str(i))
-        ids.append(str(i))
+        full_content = f"Title: {row["Title"]}\nReview: {row["Review"]}"
+        document = Document(
+            page_content=full_content,
+            metadata={
+                "rating": row["Rating"],
+                "date": row["Date"],
+                "original_csv_row_id": str(i)
+            },
+            id=f"review_doc_{i}"
+        )
         documents.append(document)
+    print(f"Loaded {len(documents)} raw documents from CSV.")
+    return documents
+    
 
-vector_store = Chroma(
-    collection_name="restaurant_reviews",
-    persist_directory=db_location,
-    embedding_function=embeddings
-)
+def chunk_documents(documents: list[Document]):
+    """Splits documents into smaller chunks for better processing, due to LLM token limits"""
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    print(f"Chunking {len(documents)} documents.")
+    chunked_documents = text_splitter.split_documents(documents)
 
-if add_documents:
-    vector_store.add_documents(documents, ids=ids)
+    '''
+    Below we assign ids to each of the chunk.
+    doc is the chunk, metadata is propogated from the parent (full document) to the chunk (doc).
+    "unknown is the default value in case the original id is not found"
+    id is an essential requirement by the chromaDB
+    '''
+    for i, doc in enumerate(chunked_documents):
+        original_doc_id = doc.metadata.get("original_csv_row_id", "unknown")
+        doc.id = f"review_chunk_{original_doc_id}_{i}"
 
-retriever = vector_store.as_retriever(
-    search_kwargs={"k": 5}
-)
+    print(f"Created {len(chunked_documents)} chunks.")
+    return chunked_documents
+
+def get_vector_store():
+    """
+    Initializes or loads the ChromaDB vector store.
+    Indexes documents if the database doesn't exist or is empty.
+    """
+    embeddings = get_embedding_model()
+    
+    db_exists_and_populated = os.path.exists(DB_LOCATION) and bool(os.listdir(DB_LOCATION))
+
+    if not db_exists_and_populated:
+        print(f"ChromaDB not found or empty at {DB_LOCATION}. Creating and indexing documents...")
+        raw_documents = load_reviews_from_csv()
+        chunked_docs = chunk_documents(raw_documents)
+        """
+        Chroma.from_documents()
+        This is a static factory method used to create a *new* Chroma vector store
+        and immediately populate it with a list of documents.
+                Working:
+        1. It internally initializes a fresh ChromaDB instance (or collection).
+        2. For each 'Document' object in the 'documents' list provided:
+           a. It uses the 'embedding' function to generate a numerical vector (embedding)
+              for the 'page_content' of that document.
+           b. It stores this generated embedding, along with the original 'page_content'
+              and its 'metadata', into the ChromaDB.
+        3. It returns this newly created and populated in-memory ChromaDB object.
+                When to use:
+        - Initial setup: When you're creating your vector database for the first time
+          from a collection of raw text documents.
+        - Rebuilding: If you need to completely re-index all your data from scratch.
+        """
+        vector_store = Chroma.from_documents(
+            documents=chunked_docs,
+            embedding=embeddings,
+            collection_name=COLLECTION_NAME,
+            persist_directory=DB_LOCATION
+        )
+        """
+        vector_store.persist()
+        This method is called on an *in-memory* ChromaDB object to save its current
+        state (embeddings, documents, and database structure) to the specified
+        'persist_directory' on disk. Without calling this, any data added to
+        the ChromaDB in memory would be lost when the Python script/application terminates.
+        """
+        vector_store.persist()
+        print("ChromaDB created and documents indexed.")
+    else:
+        print(f"Loading existing ChromaDB from {DB_LOCATION}")
+        """
+        Chroma() - Constructor
+        This is the standard constructor for the Chroma class. When used with
+        'persist_directory', its primary function is to *load* an existing
+        ChromaDB instance that was previously saved to disk.
+    
+        Working:
+        1. It does NOT generate new embeddings or add new documents.
+        2. It reads the database files from the specified 'persist_directory'.
+        3. It reconstructs the in-memory representation of the ChromaDB,
+           including all its stored embeddings, documents, and metadata.
+        4. The 'embedding_function' *must* be provided here. This tells Chroma
+           which embedding model was originally used to create the stored embeddings.
+           It's crucial for consistency when performing similarity searches later,
+           as your query will be embedded using this same function.
+    
+        When to use:
+        - Loading: When you want to retrieve a pre-existing vector database
+          from disk to perform operations like retrieval or add new documents.
+        """
+        vector_store = Chroma(
+            collection_name=COLLECTION_NAME,
+            persist_directory=DB_LOCATION,
+            embedding_function=embeddings
+        )
+        print("ChromaDB loaded")
+
+    return vector_store
+
+def add_review_to_csv_and_db(title: str, review_content: str, rating:float, date: str = None):
+    ensure_csv_exists(CSV_FILE_PATH)
+
+    if date is None:
+        date = datetime.date.today().strftime("%Y-%m-%d")
+    
+    new_review_df = pd.DataFrame([{
+        "Title": title,
+        "Date":date,
+        "Rating":rating,
+        "Review": review_content
+    }])
+
+    write_header = not os.path.exists(CSV_FILE_PATH) or os.stat(CSV_FILE_PATH).st_size == 0
+    '''
+    os.stat() is used to get some stats about the file, here we get the size of it, if it is 0 then file is empty.
+    hence, if not os.path.exists() is false (if file exists) => only then we check for stat (else it throughs file not found error)
+    if not os.path.exist() is true (file does not exist) => shorts the statement there only due to the use of "or"
+    so the header=write_header is true if file is empty or newly created else it is false
+    '''
+    new_review_df.to_csv(CSV_FILE_PATH, mode="a", header=write_header, index=False)
+    print(f"New review added to {CSV_FILE_PATH}")
+
+    current_df = pd.read_csv(CSV_FILE_PATH)
+    new_review_csv_index = len(current_df)
+
+    new_doc_content = f"Title: {title}\nReview: {review_content}"
+    new_doc = Document(
+        page_content=new_doc_content,
+        metadata={
+            "rating": rating,
+            "date": date,
+            "original_csv_row_id": str(new_review_csv_index)
+        }
+    )
+
+    chunked_new_docs = chunk_documents([new_doc])
+    current_vector_store = get_vector_store()
+    current_vector_store.add_documents(chunked_new_docs)
+    current_vector_store.persist()
+    print("New review added to ChromaDB")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL_NAME)
+
+# add_documents = not os.path.exists(DB_LOCATION) # If the db does not exist (not False) - add documents to db, if it exists (not True) - do nothing
+
+# if add_documents:
+#     documents = []
+#     ids = [] # List to store document IDs, which is required by the vectorstore
+
+#     for i, row in df.iterrows():
+#         document = Document(page_content=row["Title"] + row["Review"], metadata={"rating": row["Rating"],"date": row["Date"]},
+#                             id = str(i))
+#         ids.append(str(i))
+#         documents.append(document)
+
+# vector_store = Chroma(
+#     collection_name=COLLECTION_NAME,
+#     persist_directory=DB_LOCATION,
+#     embedding_function=embeddings
+# )
+
+# if add_documents:
+#     vector_store.add_documents(documents, ids=ids)
+
+# retriever = vector_store.as_retriever(
+#     search_kwargs={"k": RETRIEVER_K}
+# )
