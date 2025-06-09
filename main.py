@@ -1,30 +1,63 @@
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
-from vectorSearch import retriever
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains.retrieval import create_retrieval_chain
+from typing import Any
 
-model = OllamaLLM(model="gemma3:1b")
+from vectorSearch import get_vector_store, RETRIEVER_K
 
-template = """
-You are an expert in answering question about a pizza restaurant.
+LLM_MODEL_NAME = "gemma3:1b"
 
-Here are some relevant reviews: {reviews}
+def get_llm_model() -> OllamaLLM:
+    """Initializes and returns the Ollama LLM model."""
+    print(f"Initializing LLM: {LLM_MODEL_NAME}")
+    return OllamaLLM(model=LLM_MODEL_NAME)
 
-Here is a question about the restaurant: {question}
-"""
+def setup_rag_chain() -> Any:
+    """
+    Sets up the RAG chain using the LLM and retriever.
+    This function handles the core logic of querying the vector store
+    and passing relevant context to the LLM.
+    """
+    llm = get_llm_model()
+    vector_store = get_vector_store()
+    retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
 
-prompt = ChatPromptTemplate.from_template(template) # It takes variables ({reviews} and {question}) and formats them into a complete prompt string for the language model.
-chain = prompt | model # This creates a chain that combines the prompt and the model (the model will receive the prompt's output as input).
+    rag_template = """
+    You are an expert in answering questions about a pizza restaurant.
+    Use the following pieces of retrieved restaurant reviews to answer the question.
+    If you don't know the answer based on the provided reviews, just say that you don't know,
+    don't try to make up an answer.
 
-while True:
-    print("\n\n---------------------------------------")
-    user_input = input("Enter your reviews (or type 'exit' to quit): ")
-    print("\n\n")
-    if user_input.lower() == "exit":
-        break
-    reviews = retriever.invoke(user_input)
-    result = chain.invoke({
-        "reviews": [reviews],
-        "question": [user_input]
-    })
+    Context: {context}
 
-    print(result)
+    Question: {input}
+    """
+    rag_prompt = ChatPromptTemplate.from_template(rag_template)
+
+    document_combiner_chain = create_stuff_documents_chain(llm, rag_prompt)
+    '''
+    above line:
+    All retrieved documents are concatenated together into one long string of context,
+    which is then fed into the prompt for the LLM and returns the LLM's answer.
+    '''
+
+    rag_chain = create_retrieval_chain(retriever, document_combiner_chain)
+    '''
+    above line:
+    This wraps the entire RAG pipeline:
+    it retrieves relevant docs from a vector store
+    passes them to the document combiner (like the "stuff" chain)
+    gets a final response from the LLM
+    '''
+    
+    print("RAG chain setup complete.")
+    return rag_chain
+
+def get_updated_rag_chain() -> Any:
+    """
+    Re-initializes the RAG chain.
+    Useful when the underlying vector store might have been updated (e.g., new reviews added).
+    """
+    print("Re-initializing RAG chain to pick up latest vector store data...")
+    return setup_rag_chain()

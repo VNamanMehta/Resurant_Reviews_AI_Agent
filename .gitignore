@@ -1,0 +1,6 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Chroma vector DB
+chroma_lanchain_db/

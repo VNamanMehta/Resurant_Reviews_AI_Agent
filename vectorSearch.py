@@ -40,6 +40,7 @@ steps when question is asked:
    which will then generate an answer using both its own knowledge and the provided relevant reviews.
 """
 
+from csv import QUOTE_ALL
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -53,8 +54,6 @@ COLLECTION_NAME = "restaurant_reviews"
 EMBEDDING_MODEL_NAME = "nomic-embed-text:v1.5"
 RETRIEVER_K = 5 # Number of documents to retrieve for each query
 CSV_FILE_PATH = "realistic_restaurant_reviews.csv"
-
-# df = pd.read_csv(CSV_FILE_PATH)
 
 CSV_COLUMNS = ["Title", "Date", "Rating", "Review"]
 
@@ -78,7 +77,7 @@ def load_reviews_from_csv(file_path=CSV_FILE_PATH):
     df = pd.read_csv(file_path)
     documents = []
     for i, row in df.iterrows():
-        full_content = f"Title: {row["Title"]}\nReview: {row["Review"]}"
+        full_content = f"Title: {row['Title']}\nReview: {row['Review']}"
         document = Document(
             page_content=full_content,
             metadata={
@@ -90,7 +89,7 @@ def load_reviews_from_csv(file_path=CSV_FILE_PATH):
         )
         documents.append(document)
     print(f"Loaded {len(documents)} raw documents from CSV.")
-    return documents
+    return documents # it is a list of Document objects
     
 
 def chunk_documents(documents: list[Document]):
@@ -188,31 +187,46 @@ def get_vector_store():
 
     return vector_store
 
-def add_review_to_csv_and_db(title: str, review_content: str, rating:float, date: str = None):
+def add_review_to_csv_and_db(title: str, review_content: str, rating: float, date: str = None):
     ensure_csv_exists(CSV_FILE_PATH)
 
     if date is None:
         date = datetime.date.today().strftime("%Y-%m-%d")
-    
+
+    # Open the CSV file in read and append mode with UTF-8 encoding.
+    # 'a+' allows us to read and write (append) at the same time.
+    with open(CSV_FILE_PATH, 'a+', encoding='utf-8') as f:
+        # Move the file pointer to the end of the file to check if it's empty
+        f.seek(0, os.SEEK_END)
+
+        # Check if the file is not empty
+        if f.tell() > 0:
+            # Move the file pointer one byte back to read the last character
+            f.seek(f.tell() - 1, os.SEEK_SET)
+
+            # If the last character is not a newline, write a newline character
+            # This ensures the new row doesn't get appended on the same line
+            if f.read(1) != '\n':
+                f.write('\n')
+
+
     new_review_df = pd.DataFrame([{
         "Title": title,
-        "Date":date,
-        "Rating":rating,
+        "Date": date,
+        "Rating": rating,
         "Review": review_content
     }])
 
+    #check if file exists at the path and if it is empty or not, if it exists only then check if empty or not,
+    # else the os.stat() will through file not found error
     write_header = not os.path.exists(CSV_FILE_PATH) or os.stat(CSV_FILE_PATH).st_size == 0
-    '''
-    os.stat() is used to get some stats about the file, here we get the size of it, if it is 0 then file is empty.
-    hence, if not os.path.exists() is false (if file exists) => only then we check for stat (else it throughs file not found error)
-    if not os.path.exist() is true (file does not exist) => shorts the statement there only due to the use of "or"
-    so the header=write_header is true if file is empty or newly created else it is false
-    '''
-    new_review_df.to_csv(CSV_FILE_PATH, mode="a", header=write_header, index=False)
-    print(f"New review added to {CSV_FILE_PATH}")
+    new_review_df.to_csv(CSV_FILE_PATH, mode="a", header=write_header, index=False,
+                         lineterminator="\n", quoting=QUOTE_ALL)
+    print(f"✅ New review appended to {CSV_FILE_PATH}")
 
     current_df = pd.read_csv(CSV_FILE_PATH)
-    new_review_csv_index = len(current_df)
+
+    new_review_csv_index = len(current_df) - 1
 
     new_doc_content = f"Title: {title}\nReview: {review_content}"
     new_doc = Document(
@@ -227,50 +241,6 @@ def add_review_to_csv_and_db(title: str, review_content: str, rating:float, date
     chunked_new_docs = chunk_documents([new_doc])
     current_vector_store = get_vector_store()
     current_vector_store.add_documents(chunked_new_docs)
-    current_vector_store.persist()
-    print("New review added to ChromaDB")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL_NAME)
-
-# add_documents = not os.path.exists(DB_LOCATION) # If the db does not exist (not False) - add documents to db, if it exists (not True) - do nothing
-
-# if add_documents:
-#     documents = []
-#     ids = [] # List to store document IDs, which is required by the vectorstore
-
-#     for i, row in df.iterrows():
-#         document = Document(page_content=row["Title"] + row["Review"], metadata={"rating": row["Rating"],"date": row["Date"]},
-#                             id = str(i))
-#         ids.append(str(i))
-#         documents.append(document)
-
-# vector_store = Chroma(
-#     collection_name=COLLECTION_NAME,
-#     persist_directory=DB_LOCATION,
-#     embedding_function=embeddings
-# )
-
-# if add_documents:
-#     vector_store.add_documents(documents, ids=ids)
-
-# retriever = vector_store.as_retriever(
-#     search_kwargs={"k": RETRIEVER_K}
-# )
+    if hasattr(current_vector_store, "persist"):
+        current_vector_store.persist()
+    print("✅ New review indexed into ChromaDB")
