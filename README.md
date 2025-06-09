@@ -112,14 +112,6 @@ POST /api/ask_question
 }
 ```
 
----
-
-## License
-
-MIT License
-
----
-
 ## Acknowledgements
 
 - [LangChain](https://github.com/langchain-ai/langchain)
